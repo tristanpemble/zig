@@ -16,6 +16,9 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const posix = std.posix;
+const log = std.log;
+const AnySpan = std.log.AnySpan;
+const ExecutorId = std.log.ExecutorId;
 
 /// Thread-safe.
 allocator: Allocator,
@@ -94,6 +97,7 @@ const Closure = struct {
     start: Start,
     node: std.SinglyLinkedList.Node = .{},
     cancel_tid: CancelId,
+    span: ?*AnySpan = null,
 
     const Start = *const fn (*Closure) void;
 
@@ -203,6 +207,9 @@ fn join(t: *Threaded) void {
 fn worker(t: *Threaded) void {
     defer t.wait_group.finish();
 
+    const executor_id: ExecutorId = .createAndEnter();
+    defer executor_id.exit();
+
     t.mutex.lock();
     defer t.mutex.unlock();
 
@@ -210,7 +217,9 @@ fn worker(t: *Threaded) void {
         while (t.run_queue.popFirst()) |closure_node| {
             t.mutex.unlock();
             const closure: *Closure = @fieldParentPtr("node", closure_node);
+            if (closure.span) |span| span.link();
             closure.start(closure);
+            if (closure.span) |span| span.unlink();
             t.mutex.lock();
             t.busy_count -= 1;
         }
@@ -478,6 +487,7 @@ const AsyncClosure = struct {
             .closure = .{
                 .cancel_tid = .none,
                 .start = start,
+                .span = log.current_span,
             },
             .func = func,
             .context_alignment = context_alignment,
@@ -623,6 +633,7 @@ const GroupClosure = struct {
             // Even though we already know the task is canceled, we must still
             // run the closure in case there are side effects.
         }
+
         current_closure = closure;
         gc.func(group, gc.contextPointer());
         current_closure = null;
@@ -664,6 +675,7 @@ const GroupClosure = struct {
             .closure = .{
                 .cancel_tid = .none,
                 .start = start,
+                .span = log.current_span,
             },
             .t = t,
             .group = group,

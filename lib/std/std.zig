@@ -129,6 +129,19 @@ pub const Options = struct {
         args: anytype,
     ) void = log.defaultLog,
 
+    /// Userdata associated with every std.log.Span.
+    SpanUserdata: type = void,
+
+    traceFn: fn (
+        comptime level: log.Level,
+        comptime scope: @EnumLiteral(),
+        span: *log.AnySpan,
+        event: log.SpanEvent,
+        executor: log.ExecutorId,
+        comptime format: []const u8,
+        args: anytype,
+    ) void = log.defaultTrace,
+
     /// Overrides `std.heap.page_size_min`.
     page_size_min: ?usize = null,
     /// Overrides `std.heap.page_size_max`.
