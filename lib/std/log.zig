@@ -171,7 +171,8 @@ pub const ExecutorId = enum(u64) {
         return self;
     }
 
-    /// Acquires a new executor ID, replacing the current one on this thread.
+    /// Places this executor as the current for this thread, asserting that
+    /// there is no existing executor in use.
     pub fn enter(self: ExecutorId) void {
         std.debug.assert(current_executor == .none);
         current_executor = self;
@@ -355,8 +356,8 @@ pub fn Span(
             trace(level, scope, &self.any, .enter, current_executor, format, self.args);
         }
 
-        /// Signals that this span has exited execution on the current executor. Replaces this thread's
-        /// current span with the previous span.
+        /// Signals that this span has exited execution on the current executor. Removes the thread's
+        /// current span.
         pub fn exit(self: *Self) void {
             std.debug.assert(current_span == &self.any);
             trace(level, scope, &self.any, .exit, current_executor, format, self.args);
