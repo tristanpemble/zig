@@ -335,9 +335,9 @@ pub fn Span(
 
         /// Begins the span on this thread's current executor.
         pub fn begin(self: *Self) void {
-            trace(level, scope, &self.any, .begin, current_executor, format, self.args);
             self.prev = current_span;
             current_span = &self.any;
+            trace(level, scope, &self.any, .begin, current_executor, format, self.args);
         }
 
         /// Ends the span on this thread's current executor.
