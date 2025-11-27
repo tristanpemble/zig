@@ -25,7 +25,10 @@
 //! ```
 
 const std = @import("std.zig");
+const assert = std.debug.assert;
 const builtin = @import("builtin");
+const SourceLocation = std.builtin.SourceLocation;
+const SpanUserdata = std.options.SpanUserdata;
 
 pub const Level = enum {
     /// Error: something has gone wrong. This might be recoverable or might
@@ -114,86 +117,96 @@ pub fn defaultLog(
 }
 
 fn trace(
-    comptime level: Level,
+    comptime level: log.Level,
     comptime scope: @EnumLiteral(),
-    any_span: *AnySpan,
-    event: SpanEvent,
-    executor: ExecutorId,
-    comptime format: []const u8,
-    args: anytype,
+    comptime src: SourceLocation,
+    comptime event: log.SpanEvent,
+    executor: log.Executor,
+    span: *log.Span,
 ) void {
     if (comptime !logEnabled(level, scope)) return;
-
-    std.options.traceFn(level, scope, any_span, event, executor, format, args);
+    std.options.traceFn(level, scope, event, executor, span);
 }
 
 pub fn defaultTrace(
-    comptime level: Level,
+    comptime level: log.Level,
     comptime scope: @EnumLiteral(),
-    any_span: *AnySpan,
-    event: SpanEvent,
-    executor: ExecutorId,
-    comptime format: []const u8,
-    args: anytype,
+    comptime src: SourceLocation,
+    comptime event: log.SpanEvent,
+    executor: log.Executor,
+    span: *log.Span,
 ) void {
-    _ = any_span;
+    _ = level;
+    _ = scope;
+    _ = event;
     _ = executor;
-    switch (event) {
-        .begin => log(level, scope, "[>>] " ++ format, args),
-        .end => log(level, scope, "[<<] " ++ format, args),
-        else => {},
-    }
+    _ = span;
 }
 
-/// This thread's current executor ID.
-pub threadlocal var current_executor: ExecutorId = .none;
+/// This thread's currently running executor.
+pub threadlocal var thread_executor: Executor = .none;
 
-/// This thread's currently tracked span.
-pub threadlocal var current_span: ?*AnySpan = null;
+/// This thread's currently excuting span.
+pub threadlocal var thread_span: Span = .empty;
 
-/// A monotonically increasing, unique identifier for an "executor". Depending
-/// on the `std.Io` implementation in use, an executor can be a native thread, a
-/// green thread, etc.
-pub const ExecutorId = enum(u64) {
+/// An executor can be a thread, fiber, or whatever the std.Io implementation
+/// decides it is. Internally it is represented by a monotonically increasing
+/// integer, but that is an implementation detail, and should not be relied
+/// upon.
+pub const Executor = enum(u64) {
     none = std.math.maxInt(u64),
     _,
 
     /// A globally unique, monotonically increasing executor identifier.
     var next_id: std.atomic.Value(u64) = .init(0);
 
-    pub fn create() ExecutorId {
+    pub fn create() Executor {
         return @enumFromInt(next_id.fetchAdd(1, .monotonic));
     }
 
-    pub fn createAndEnter() ExecutorId {
-        const self = create();
-        self.enter();
-        return self;
+    pub fn link(self: Executor, span_: *Span) void {
+        if (span_.id == .none) return;
+        span_.vtable.linkFn(span_, self);
     }
 
-    /// Places this executor as the current for this thread, asserting that
-    /// there is no existing executor in use.
-    pub fn enter(self: ExecutorId) void {
-        std.debug.assert(current_executor == .none);
-        current_executor = self;
-    }
-
-    /// Places this executor as the current executor on this thread, asserting
-    /// that the current executor is what we expect.
-    pub fn compareExchange(self: ExecutorId, expected: ExecutorId) void {
-        std.debug.assert(current_executor == expected);
-        current_executor = self;
-    }
-
-    /// Releases this executor ID, setting the current executor ID to `.none`.
-    pub fn exit(self: ExecutorId) void {
-        std.debug.assert(current_executor == self);
-        current_executor = .none;
+    pub fn unlink(self: Executor, span_: *Span) void {
+        if (span_.id == .none) return;
+        span_.vtable.unlinkFn(span_, self);
     }
 };
 
-/// A monotonically increasing, unique identifier for an individual `Span`. Only
-/// unique within the application's lifetime.
+/// An execution span.
+pub const Span = struct {
+    id: SpanId,
+    vtable: *const VTable,
+    userdata: SpanUserdata,
+
+    pub const empty: Span = .{
+        .id = .none,
+        .vtable = undefined,
+        .userdata = undefined,
+    };
+
+    pub const VTable = struct {
+        suspendFn: *const fn (self: *Span) void,
+        resumeFn: *const fn (self: *Span) void,
+        linkFn: *const fn (self: *Span, executor: Executor) void,
+        unlinkFn: *const fn (self: *Span, executor: Executor) void,
+    };
+
+    pub fn @"suspend"(self: *Span) Span {
+        if (self.id == .none) return empty;
+        return self.vtable.suspendFn(self);
+    }
+
+    pub fn @"resume"(self: *Span) void {
+        if (self.id == .none) return;
+        self.vtable.resumeFn(self);
+    }
+};
+
+/// Internally this is represented by a monotonically increasing integer, but
+/// that is an implementation detail, and should not be relied upon.
 pub const SpanId = enum(u64) {
     none = std.math.maxInt(u64),
     _,
@@ -204,41 +217,6 @@ pub const SpanId = enum(u64) {
     /// Acquires a new `SpanId`.
     pub fn createNext() SpanId {
         return @enumFromInt(next_id.fetchAdd(1, .monotonic));
-    }
-};
-
-/// A type erased interface to a `Span`.
-pub const AnySpan = struct {
-    linkFn: *const fn (*AnySpan) void,
-    unlinkFn: *const fn (*AnySpan) void,
-
-    pub const empty: AnySpan = .{
-        .linkFn = struct {
-            fn link(_: *AnySpan) void {}
-        }.link,
-        .unlinkFn = struct {
-            fn unlink(_: *AnySpan) void {}
-        }.unlink,
-    };
-
-    pub fn link(self: *AnySpan) void {
-        self.linkFn(self);
-    }
-
-    pub fn unlink(self: *AnySpan) void {
-        self.unlinkFn(self);
-    }
-
-    /// Get a pointer to the typed `Span`.
-    pub fn asSpan(
-        any: *AnySpan,
-        comptime level: Level,
-        comptime scope: @EnumLiteral(),
-        comptime format: []const u8,
-        comptime Args: type,
-    ) *Span(level, scope, format, Args) {
-        const self: *Span(level, scope, format, Args) = @fieldParentPtr("any", any);
-        return self;
     }
 };
 
@@ -270,127 +248,95 @@ pub const AnySpan = struct {
 ///     }
 /// }.myFn, .{ &span.any });
 /// ```
-pub fn Span(
-    comptime level: Level,
-    comptime scope: @EnumLiteral(),
-    comptime format: []const u8,
-    comptime Args: type,
-) type {
+pub fn ScopedSpan(comptime level: Level, comptime scope: @EnumLiteral(), comptime src: std.builtin.SourceLocation) type {
     return if (!logEnabled(level, scope)) struct {
         const Self = @This();
 
-        id: void,
-        address: void,
-        args: void,
-        prev: void,
-        any: AnySpan = .empty,
-        userdata: void,
-
-        pub fn init(_: usize, _: Args) Self {
+        pub fn begin() Self {
             return .{};
         }
-        pub fn begin(_: *Self) void {}
         pub fn end(_: *Self) void {}
-        pub fn enter(_: *Self) void {}
-        pub fn exit(_: *Self) void {}
-        pub fn link(_: *Self) void {}
-        pub fn unlink(_: *Self) void {}
     } else struct {
         const Self = @This();
 
         id: SpanId,
-        address: usize,
-        args: Args,
-        /// A pointer to the parent span on this executor, forming a linked list.
-        prev: ?*AnySpan,
-        /// The `AnySpan` type erased interface.
-        any: AnySpan,
-        /// Custom userdata for the span, defined on `std.Options`.
-        userdata: std.options.SpanUserdata,
+        prev: Span,
 
-        /// Initializes the `Span`, but does not begin it.
-        pub fn init(address: usize, args: Args) Self {
-            return .{
-                .id = .createNext(),
-                .address = address,
-                .args = args,
-                .prev = null,
-                .any = .{
-                    .linkFn = struct {
-                        fn link(any: *AnySpan) void {
-                            const self = any.asSpan(level, scope, format, Args);
-                            return self.link();
-                        }
-                    }.link,
-                    .unlinkFn = struct {
-                        fn unlink(any: *AnySpan) void {
-                            const self = any.asSpan(level, scope, format, Args);
-                            return self.unlink();
-                        }
-                    }.unlink,
+        pub fn begin() Self {
+            const id: SpanId = .createNext();
+            const prev = thread_span;
+            thread_span = .{
+                .id = id,
+                .vtable = &.{
+                    .suspendFn = @"suspend",
+                    .resumeFn = @"resume",
+                    .linkFn = link,
+                    .unlinkFn = unlink,
                 },
                 .userdata = undefined,
             };
+            trace(level, scope, src, .begin, thread_executor, &thread_span);
+            return .{ .id = id, .prev = prev };
         }
 
-        /// Begins the span on this thread's current executor.
-        pub fn begin(self: *Self) void {
-            self.prev = current_span;
-            current_span = &self.any;
-            trace(level, scope, &self.any, .begin, current_executor, format, self.args);
-        }
-
-        /// Ends the span on this thread's current executor.
         pub fn end(self: *Self) void {
-            std.debug.assert(current_span == &self.any);
-            trace(level, scope, &self.any, .end, current_executor, format, self.args);
-            current_span = self.prev;
+            // Swap the previous span, that we stored from begin,
+            assert(thread_span.id != .none);
+            assert(thread_span.id == self.id);
+            trace(level, scope, src, .end, thread_executor, &thread_span);
+            thread_span = self.span;
             self.* = undefined;
         }
 
-        /// Signals that this span has entered execution on the current executor. Replaces this thread's
-        /// current span with itself.
-        pub fn enter(self: *Self) void {
-            std.debug.assert(current_span == null);
-            current_span = &self.any;
-            trace(level, scope, &self.any, .enter, current_executor, format, self.args);
+        fn @"suspend"(span_: *Span) Span {
+            assert(span_.id != .none);
+            assert(thread_span.id != .none);
+            assert(thread_span.id == span_.id);
+            trace(level, scope, src, .@"suspend", thread_executor, &thread_span);
+            const suspended = span_.*;
+            thread_span = .empty;
+            return suspended;
         }
 
-        /// Signals that this span has exited execution on the current executor. Removes the thread's
-        /// current span.
-        pub fn exit(self: *Self) void {
-            std.debug.assert(current_span == &self.any);
-            trace(level, scope, &self.any, .exit, current_executor, format, self.args);
-            current_span = null;
+        fn @"resume"(span_: *Span) void {
+            assert(span_.id != .none);
+            assert(thread_span.id == .none);
+            thread_span = span_.*;
+            trace(level, scope, src, .@"resume", thread_executor, &thread_span);
         }
 
-        /// Links the span to this thread's current executor.
-        pub fn link(self: *Self) void {
-            std.debug.assert(current_span == null);
-            trace(level, scope, &self.any, .link, current_executor, format, self.args);
+        fn link(span_: *Span, executor: Executor) void {
+            assert(executor != .none);
+            assert(span_.id != .none);
+            assert(thread_executor == .none);
+            assert(thread_span.id == .none);
+            thread_executor = executor;
+            trace(level, scope, src, .link, thread_executor, span_);
         }
 
-        /// Unlinks the span from this thread's current executor.
-        pub fn unlink(self: *Self) void {
-            std.debug.assert(current_span == null);
-            trace(level, scope, &self.any, .unlink, current_executor, format, self.args);
+        fn unlink(span_: *Span, executor: Executor) void {
+            assert(thread_executor != .none);
+            assert(thread_executor == executor);
+            assert(thread_span.id == .none);
+            trace(level, scope, src, .unlink, thread_executor, span_);
+            thread_executor = null;
         }
     };
 }
 
 pub const SpanEvent = enum {
-    /// The span has begun work on this thread's current executor.
+    /// An executor has begun work on this span.
     begin,
-    /// The span has ended work on this thread's current executor.
+    /// An executor has completed work on this span.
     end,
-    /// A child executor has been linked to the span.
+    /// An executor has suspended work on this span.
+    @"suspend",
+    /// An executor has resumed work on this span.
+    @"resume",
+    /// An executor has started work requested within the span.
     link,
-    /// A child executor has been unlinked from the span.
+    /// An executor has stopped work requested within the span.
     unlink,
-    /// The span itself has moved to an executor.
-    enter,
-    /// The span itself has moved from an executor.
-    exit,
 };
 
 /// Returns a scoped logging namespace that logs all messages using the scope
@@ -440,10 +386,9 @@ pub fn scoped(comptime scope: @EnumLiteral()) type {
         /// and ended after initialization.
         pub fn span(
             comptime level: Level,
-            comptime format: []const u8,
-            args: anytype,
-        ) Span(level, scope, format, @TypeOf(args)) {
-            return .init(@returnAddress(), args);
+            comptime src: SourceLocation,
+        ) ScopedSpan(level, scope, src) {
+            return .begin();
         }
     };
 }

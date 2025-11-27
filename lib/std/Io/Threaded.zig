@@ -17,8 +17,8 @@ const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const posix = std.posix;
 const log = std.log;
-const AnySpan = std.log.AnySpan;
-const ExecutorId = std.log.ExecutorId;
+const Span = std.log.Span;
+const Executor = std.log.Executor;
 
 /// Thread-safe.
 allocator: Allocator,
@@ -97,7 +97,7 @@ const Closure = struct {
     start: Start,
     node: std.SinglyLinkedList.Node = .{},
     cancel_tid: CancelId,
-    span: ?*AnySpan = null,
+    span: Span = .empty,
 
     const Start = *const fn (*Closure) void;
 
@@ -207,8 +207,8 @@ fn join(t: *Threaded) void {
 fn worker(t: *Threaded) void {
     defer t.wait_group.finish();
 
-    const executor_id: ExecutorId = .createAndEnter();
-    defer executor_id.exit();
+    const executor: Executor = .create();
+    defer executor.exit();
 
     t.mutex.lock();
     defer t.mutex.unlock();
@@ -217,9 +217,9 @@ fn worker(t: *Threaded) void {
         while (t.run_queue.popFirst()) |closure_node| {
             t.mutex.unlock();
             const closure: *Closure = @fieldParentPtr("node", closure_node);
-            if (closure.span) |span| span.link();
+            executor.link(&closure.span);
             closure.start(closure);
-            if (closure.span) |span| span.unlink();
+            executor.unlink(&closure.span);
             t.mutex.lock();
             t.busy_count -= 1;
         }
@@ -487,7 +487,7 @@ const AsyncClosure = struct {
             .closure = .{
                 .cancel_tid = .none,
                 .start = start,
-                .span = log.current_span,
+                .span = log.thread_span,
             },
             .func = func,
             .context_alignment = context_alignment,
@@ -675,7 +675,7 @@ const GroupClosure = struct {
             .closure = .{
                 .cancel_tid = .none,
                 .start = start,
-                .span = log.current_span,
+                .span = log.thread_span,
             },
             .t = t,
             .group = group,
